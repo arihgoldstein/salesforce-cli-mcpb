@@ -6,10 +6,46 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { existsSync, readdirSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 const execFileAsync = promisify(execFile);
-const SF_PATH = process.env.SF_PATH || "sf";
 const DEFAULT_ORG = process.env.DEFAULT_ORG || "";
+
+function findSfPath() {
+  if (process.env.SF_PATH && process.env.SF_PATH !== "sf") {
+    return process.env.SF_PATH;
+  }
+  const home = homedir();
+  const candidates = [
+    join(home, ".local", "nodejs", "bin", "sf"),
+    join(home, ".local", "bin", "sf"),
+    join(home, ".nvm", "current", "bin", "sf"),
+    "/usr/local/bin/sf",
+    "/opt/homebrew/bin/sf",
+    "/usr/bin/sf",
+    join(home, ".volta", "bin", "sf"),
+    join(home, "AppData", "Roaming", "npm", "sf.cmd"),
+    join(home, "AppData", "Roaming", "npm", "sf"),
+  ];
+  // Check nvm versioned dirs (e.g. ~/.nvm/versions/node/v22.x.x/bin/sf)
+  const nvmVersionsDir = join(home, ".nvm", "versions", "node");
+  if (existsSync(nvmVersionsDir)) {
+    try {
+      const versions = readdirSync(nvmVersionsDir).sort().reverse();
+      for (const v of versions) {
+        candidates.push(join(nvmVersionsDir, v, "bin", "sf"));
+      }
+    } catch {}
+  }
+  for (const p of candidates) {
+    if (existsSync(p)) return p;
+  }
+  return "sf";
+}
+
+const SF_PATH = findSfPath();
 
 async function runSf(args) {
   try {
