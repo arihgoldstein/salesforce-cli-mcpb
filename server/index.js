@@ -4,122 +4,340 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
-import { existsSync, readdirSync } from "node:fs";
+import { createServer } from "node:http";
+import {
+  readFileSync,
+  writeFileSync,
+  existsSync,
+  mkdirSync,
+} from "node:fs";
 import { homedir } from "node:os";
-import { join, dirname } from "node:path";
+import { join } from "node:path";
+import { exec } from "node:child_process";
 
-const execFileAsync = promisify(execFile);
-const DEFAULT_ORG = process.env.DEFAULT_ORG || "";
+// ─── Configuration ──────────────────────────────────────────
+const API_VERSION = "62.0";
+const CLIENT_ID = "PlatformCLI";
+const CALLBACK_PORT = 1717;
+const CALLBACK_URL = `http://localhost:${CALLBACK_PORT}/OauthRedirect`;
+const CREDS_DIR = join(homedir(), ".sf-claude");
+const CREDS_FILE = join(CREDS_DIR, "credentials.json");
 
-function findSfPath() {
-  if (process.env.SF_PATH && process.env.SF_PATH !== "sf") {
-    return process.env.SF_PATH;
-  }
-  const home = homedir();
-  const candidates = [
-    join(home, ".local", "nodejs", "bin", "sf"),
-    join(home, ".local", "bin", "sf"),
-    join(home, ".nvm", "current", "bin", "sf"),
-    "/usr/local/bin/sf",
-    "/opt/homebrew/bin/sf",
-    "/usr/bin/sf",
-    join(home, ".volta", "bin", "sf"),
-    join(home, "AppData", "Roaming", "npm", "sf.cmd"),
-    join(home, "AppData", "Roaming", "npm", "sf"),
-  ];
-  // Check nvm versioned dirs (e.g. ~/.nvm/versions/node/v22.x.x/bin/sf)
-  const nvmVersionsDir = join(home, ".nvm", "versions", "node");
-  if (existsSync(nvmVersionsDir)) {
-    try {
-      const versions = readdirSync(nvmVersionsDir).sort().reverse();
-      for (const v of versions) {
-        candidates.push(join(nvmVersionsDir, v, "bin", "sf"));
-      }
-    } catch {}
-  }
-  for (const p of candidates) {
-    if (existsSync(p)) return p;
-  }
-  return "sf";
-}
-
-const SF_PATH = findSfPath();
-// Add sf's directory to PATH so #!/usr/bin/env node resolves
-const SF_DIR = dirname(SF_PATH);
-const ENV = {
-  ...process.env,
-  SF_JSON_OUTPUT: "true",
-  PATH: SF_DIR + ":" + (process.env.PATH || ""),
-};
-
-async function runSf(args) {
+// ─── Credential Storage ────────────────────────────────────
+function loadOrgs() {
+  if (!existsSync(CREDS_FILE)) return {};
   try {
-    const { stdout, stderr } = await execFileAsync(SF_PATH, args, {
-      maxBuffer: 10 * 1024 * 1024,
-      timeout: 120000,
-      env: ENV,
-    });
-    return stdout || stderr;
-  } catch (err) {
-    if (err.stdout) return err.stdout;
-    if (err.stderr) return err.stderr;
-    throw new Error(`sf command failed: ${err.message}`);
+    return JSON.parse(readFileSync(CREDS_FILE, "utf8"));
+  } catch {
+    return {};
   }
 }
 
-function resolveOrg(orgAlias) {
-  return orgAlias || DEFAULT_ORG || undefined;
+function saveOrgs(orgs) {
+  if (!existsSync(CREDS_DIR)) mkdirSync(CREDS_DIR, { recursive: true });
+  writeFileSync(CREDS_FILE, JSON.stringify(orgs, null, 2));
 }
 
-function orgArgs(orgAlias) {
-  const org = resolveOrg(orgAlias);
-  return org ? ["--target-org", org] : [];
+function getOrg(alias) {
+  const orgs = loadOrgs();
+  const key = alias || process.env.DEFAULT_ORG;
+  if (key && orgs[key]) return { _alias: key, ...orgs[key] };
+  const keys = Object.keys(orgs);
+  if (keys.length === 0) {
+    throw new Error(
+      "No Salesforce orgs connected. Use the sf_org_login tool to authenticate."
+    );
+  }
+  return { _alias: keys[0], ...orgs[keys[0]] };
 }
 
+// ─── Token Refresh ─────────────────────────────────────────
+async function refreshToken(org) {
+  const res = await fetch(`${org.loginUrl}/services/oauth2/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "refresh_token",
+      client_id: CLIENT_ID,
+      refresh_token: org.refreshToken,
+    }),
+  });
+  if (!res.ok) {
+    throw new Error(
+      "Session expired. Re-authenticate with sf_org_login."
+    );
+  }
+  const data = await res.json();
+  const orgs = loadOrgs();
+  if (orgs[org._alias]) {
+    orgs[org._alias].accessToken = data.access_token;
+    if (data.instance_url) orgs[org._alias].instanceUrl = data.instance_url;
+    saveOrgs(orgs);
+  }
+  return data.access_token;
+}
+
+// ─── Salesforce API Helper ─────────────────────────────────
+async function sfApi(orgAlias, path, opts = {}) {
+  const org = getOrg(orgAlias);
+  const doFetch = (token) =>
+    fetch(
+      `${org.instanceUrl}/services/data/v${API_VERSION}${path}`,
+      {
+        method: opts.method || "GET",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+          ...opts.headers,
+        },
+        body:
+          opts.body != null
+            ? typeof opts.body === "string"
+              ? opts.body
+              : JSON.stringify(opts.body)
+            : undefined,
+      }
+    );
+
+  let res = await doFetch(org.accessToken);
+  if (res.status === 401 && org.refreshToken) {
+    const newToken = await refreshToken(org);
+    res = await doFetch(newToken);
+  }
+  if (res.status === 204) return { success: true };
+  const data = await res.json();
+  if (!res.ok) throw new Error(JSON.stringify(data, null, 2));
+  return data;
+}
+
+// Raw API call (for endpoints with full path like /services/...)
+async function sfRawApi(orgAlias, fullPath, opts = {}) {
+  const org = getOrg(orgAlias);
+  const doFetch = (token) =>
+    fetch(`${org.instanceUrl}${fullPath}`, {
+      method: opts.method || "GET",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+        ...opts.headers,
+      },
+      body:
+        opts.body != null
+          ? typeof opts.body === "string"
+            ? opts.body
+            : JSON.stringify(opts.body)
+          : undefined,
+    });
+
+  let res = await doFetch(org.accessToken);
+  if (res.status === 401 && org.refreshToken) {
+    const newToken = await refreshToken(org);
+    res = await doFetch(newToken);
+  }
+  return res;
+}
+
+// ─── OAuth Login Flow ──────────────────────────────────────
+function oauthLogin(alias, loginUrl) {
+  return new Promise((resolve, reject) => {
+    const params = new URLSearchParams({
+      response_type: "code",
+      client_id: CLIENT_ID,
+      redirect_uri: CALLBACK_URL,
+      scope: "api refresh_token",
+    });
+    const authUrl = `${loginUrl}/services/oauth2/authorize?${params}`;
+    let settled = false;
+
+    const httpServer = createServer(async (req, res) => {
+      if (settled) return;
+      const url = new URL(req.url, `http://localhost:${CALLBACK_PORT}`);
+      if (url.pathname !== "/OauthRedirect") {
+        res.writeHead(404);
+        res.end();
+        return;
+      }
+
+      const code = url.searchParams.get("code");
+      const error = url.searchParams.get("error");
+      if (error || !code) {
+        settled = true;
+        res.writeHead(400, { "Content-Type": "text/html" });
+        res.end(
+          `<html><body style="font-family:system-ui;text-align:center;padding:60px"><h2>Authentication failed</h2><p>${error || "No authorization code received"}</p></body></html>`
+        );
+        httpServer.close();
+        reject(new Error(error || "No authorization code received"));
+        return;
+      }
+
+      try {
+        const tokenRes = await fetch(
+          `${loginUrl}/services/oauth2/token`,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/x-www-form-urlencoded",
+            },
+            body: new URLSearchParams({
+              grant_type: "authorization_code",
+              client_id: CLIENT_ID,
+              redirect_uri: CALLBACK_URL,
+              code,
+            }),
+          }
+        );
+        if (!tokenRes.ok) throw new Error(await tokenRes.text());
+        const tokens = await tokenRes.json();
+
+        let identity = {};
+        try {
+          const idRes = await fetch(tokens.id, {
+            headers: {
+              Authorization: `Bearer ${tokens.access_token}`,
+            },
+          });
+          if (idRes.ok) identity = await idRes.json();
+        } catch {}
+
+        const orgData = {
+          accessToken: tokens.access_token,
+          refreshToken: tokens.refresh_token,
+          instanceUrl: tokens.instance_url,
+          loginUrl,
+          username: identity.username || "",
+          orgId: identity.organization_id || "",
+          displayName: identity.display_name || "",
+          authenticatedAt: new Date().toISOString(),
+        };
+
+        const orgs = loadOrgs();
+        orgs[alias] = orgData;
+        saveOrgs(orgs);
+
+        settled = true;
+        res.writeHead(200, { "Content-Type": "text/html" });
+        res.end(
+          [
+            '<html><body style="font-family:system-ui;text-align:center;padding:60px">',
+            '<h2 style="color:#22c55e">Connected to Salesforce</h2>',
+            `<p style="font-size:18px"><b>${orgData.username}</b></p>`,
+            `<p>Saved as: <code style="background:#f1f5f9;padding:2px 8px;border-radius:4px">${alias}</code></p>`,
+            '<p style="color:#666;margin-top:24px">You can close this window and return to Claude.</p>',
+            "</body></html>",
+          ].join("")
+        );
+        httpServer.close();
+        resolve(orgData);
+      } catch (err) {
+        settled = true;
+        res.writeHead(500, { "Content-Type": "text/html" });
+        res.end(
+          `<html><body style="font-family:system-ui;text-align:center;padding:60px"><h2>Authentication failed</h2><pre>${err.message}</pre></body></html>`
+        );
+        httpServer.close();
+        reject(err);
+      }
+    });
+
+    httpServer.on("error", (err) => {
+      if (!settled) {
+        settled = true;
+        reject(
+          new Error(
+            `Could not start login server on port ${CALLBACK_PORT}: ${err.message}. Is another sf login in progress?`
+          )
+        );
+      }
+    });
+
+    httpServer.listen(CALLBACK_PORT, () => {
+      const open =
+        process.platform === "darwin"
+          ? "open"
+          : process.platform === "win32"
+            ? "start"
+            : "xdg-open";
+      exec(`${open} "${authUrl}"`);
+    });
+
+    setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        httpServer.close();
+        reject(new Error("Login timed out after 2 minutes. Try again."));
+      }
+    }, 120000);
+  });
+}
+
+// ─── Tool Definitions ──────────────────────────────────────
 const TOOLS = [
   {
-    name: "sf_org_list",
+    name: "sf_org_login",
     description:
-      "List all authenticated Salesforce orgs. Returns aliases, usernames, org IDs, and connection status.",
+      "Connect a Salesforce org by opening a browser login window. Use login_url 'https://test.salesforce.com' for sandboxes.",
     inputSchema: {
       type: "object",
       properties: {
-        all: {
-          type: "boolean",
-          description: "Include expired and deleted scratch orgs",
+        alias: {
+          type: "string",
+          description:
+            "Short name for this org (e.g. 'prod', 'dev', 'staging')",
+        },
+        login_url: {
+          type: "string",
+          description:
+            "https://login.salesforce.com (production, default) or https://test.salesforce.com (sandbox)",
         },
       },
+      required: ["alias"],
     },
+  },
+  {
+    name: "sf_org_logout",
+    description: "Disconnect a Salesforce org and remove stored credentials.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        alias: { type: "string", description: "Org alias to disconnect" },
+      },
+      required: ["alias"],
+    },
+  },
+  {
+    name: "sf_org_list",
+    description:
+      "List all connected Salesforce orgs with aliases, usernames, and instance URLs.",
+    inputSchema: { type: "object", properties: {} },
   },
   {
     name: "sf_org_display",
     description:
-      "Display detailed information about a specific org including instance URL, username, access token expiry, and org type.",
+      "Show detailed information about a connected org.",
     inputSchema: {
       type: "object",
       properties: {
-        org: {
-          type: "string",
-          description: "Org alias or username",
-        },
+        org: { type: "string", description: "Org alias" },
       },
-      required: ["org"],
     },
   },
   {
     name: "sf_query",
     description:
-      "Execute a SOQL query against a Salesforce org. Returns records in JSON format.",
+      "Execute a SOQL query. Returns matching records in JSON.",
     inputSchema: {
       type: "object",
       properties: {
-        query: { type: "string", description: "SOQL query string" },
-        org: { type: "string", description: "Org alias or username" },
+        query: {
+          type: "string",
+          description:
+            'SOQL query (e.g. "SELECT Id, Name FROM Account LIMIT 10")',
+        },
+        org: { type: "string", description: "Org alias" },
         tooling: {
           type: "boolean",
-          description: "Use Tooling API instead of standard API",
+          description: "Query the Tooling API instead",
         },
       },
       required: ["query"],
@@ -127,12 +345,15 @@ const TOOLS = [
   },
   {
     name: "sf_search",
-    description: "Execute a SOSL text search against a Salesforce org.",
+    description: "Execute a SOSL text search across objects.",
     inputSchema: {
       type: "object",
       properties: {
-        query: { type: "string", description: "SOSL query string" },
-        org: { type: "string", description: "Org alias or username" },
+        query: {
+          type: "string",
+          description: 'SOSL query (e.g. "FIND {Acme} IN ALL FIELDS")',
+        },
+        org: { type: "string", description: "Org alias" },
       },
       required: ["query"],
     },
@@ -140,13 +361,15 @@ const TOOLS = [
   {
     name: "sf_describe",
     description:
-      "Describe an SObject — returns all fields, field types, relationships, picklist values, and metadata.",
+      "Describe an SObject — returns fields, types, relationships, picklist values.",
     inputSchema: {
       type: "object",
       properties: {
-        sobject: { type: "string", description: "API name of the SObject" },
-        org: { type: "string", description: "Org alias or username" },
-        tooling: { type: "boolean", description: "Use Tooling API" },
+        sobject: {
+          type: "string",
+          description: "API name (e.g. Account, Opportunity, Custom__c)",
+        },
+        org: { type: "string", description: "Org alias" },
       },
       required: ["sobject"],
     },
@@ -157,221 +380,89 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
-        org: { type: "string", description: "Org alias or username" },
-        category: {
-          type: "string",
-          description: "Filter by category: all, custom, standard",
-        },
+        org: { type: "string", description: "Org alias" },
       },
     },
   },
   {
     name: "sf_create_record",
-    description: "Create a new record on a Salesforce SObject.",
+    description: "Create a new record.",
     inputSchema: {
       type: "object",
       properties: {
-        sobject: { type: "string", description: "API name of the SObject" },
+        sobject: { type: "string", description: "SObject API name" },
         values: {
-          type: "string",
+          type: "object",
           description:
-            'Field values in format: "Field1=value1 Field2=value2"',
+            'Field values as JSON (e.g. {"Name": "Acme", "Industry": "Technology"})',
         },
-        org: { type: "string", description: "Org alias or username" },
+        org: { type: "string", description: "Org alias" },
       },
       required: ["sobject", "values"],
     },
   },
   {
     name: "sf_update_record",
-    description: "Update an existing record on a Salesforce SObject.",
+    description: "Update an existing record.",
     inputSchema: {
       type: "object",
       properties: {
-        sobject: { type: "string", description: "API name of the SObject" },
-        record_id: { type: "string", description: "Record ID to update" },
-        where: {
-          type: "string",
-          description:
-            'Alternative to record_id: field=value pairs to identify record (e.g. "Name=Acme")',
-        },
+        sobject: { type: "string", description: "SObject API name" },
+        record_id: { type: "string", description: "Record ID" },
         values: {
-          type: "string",
-          description:
-            'Field values to update in format: "Field1=value1 Field2=value2"',
+          type: "object",
+          description: "Field values to update",
         },
-        org: { type: "string", description: "Org alias or username" },
+        org: { type: "string", description: "Org alias" },
       },
-      required: ["sobject", "values"],
+      required: ["sobject", "record_id", "values"],
     },
   },
   {
     name: "sf_delete_record",
-    description: "Delete a record from a Salesforce SObject.",
+    description: "Delete a record.",
     inputSchema: {
       type: "object",
       properties: {
-        sobject: { type: "string", description: "API name of the SObject" },
-        record_id: { type: "string", description: "Record ID to delete" },
-        where: {
-          type: "string",
-          description: "Alternative: field=value pairs to identify record",
-        },
-        org: { type: "string", description: "Org alias or username" },
+        sobject: { type: "string", description: "SObject API name" },
+        record_id: { type: "string", description: "Record ID" },
+        org: { type: "string", description: "Org alias" },
       },
-      required: ["sobject"],
+      required: ["sobject", "record_id"],
     },
   },
   {
     name: "sf_get_record",
-    description: "Retrieve a single record by ID or field criteria.",
+    description: "Retrieve a single record by ID.",
     inputSchema: {
       type: "object",
       properties: {
-        sobject: { type: "string", description: "API name of the SObject" },
+        sobject: { type: "string", description: "SObject API name" },
         record_id: { type: "string", description: "Record ID" },
-        where: {
+        fields: {
           type: "string",
-          description: "Alternative: field=value pairs",
+          description: "Comma-separated field names (optional, returns all if omitted)",
         },
-        org: { type: "string", description: "Org alias or username" },
+        org: { type: "string", description: "Org alias" },
       },
-      required: ["sobject"],
-    },
-  },
-  {
-    name: "sf_bulk_import",
-    description:
-      "Bulk import records into an SObject from a CSV file using Bulk API 2.0.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        sobject: { type: "string", description: "API name of the SObject" },
-        file: { type: "string", description: "Path to CSV file" },
-        org: { type: "string", description: "Org alias or username" },
-        operation: {
-          type: "string",
-          enum: ["insert", "upsert"],
-          description: "Bulk operation type",
-        },
-        external_id: {
-          type: "string",
-          description: "External ID field for upsert operations",
-        },
-      },
-      required: ["sobject", "file"],
-    },
-  },
-  {
-    name: "sf_bulk_export",
-    description:
-      "Bulk export records from an SObject to a file using Bulk API 2.0.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        query: { type: "string", description: "SOQL query for export" },
-        output_file: {
-          type: "string",
-          description: "Path to output file",
-        },
-        format: {
-          type: "string",
-          enum: ["csv", "json"],
-          description: "Output format",
-          default: "csv",
-        },
-        org: { type: "string", description: "Org alias or username" },
-      },
-      required: ["query", "output_file"],
-    },
-  },
-  {
-    name: "sf_deploy",
-    description:
-      "Deploy metadata to an org from a local source directory or manifest.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        source_dir: {
-          type: "string",
-          description: "Path to source directory to deploy",
-        },
-        metadata: {
-          type: "string",
-          description:
-            'Metadata components to deploy (e.g. "ApexClass:MyClass")',
-        },
-        manifest: {
-          type: "string",
-          description: "Path to package.xml manifest",
-        },
-        org: { type: "string", description: "Org alias or username" },
-        dry_run: {
-          type: "boolean",
-          description: "Validate only, don't deploy",
-        },
-        test_level: {
-          type: "string",
-          enum: [
-            "NoTestRun",
-            "RunSpecifiedTests",
-            "RunLocalTests",
-            "RunAllTestsInOrg",
-          ],
-          description: "Test level for deployment",
-        },
-      },
-    },
-  },
-  {
-    name: "sf_retrieve",
-    description: "Retrieve metadata from an org to a local directory.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        metadata: {
-          type: "string",
-          description:
-            'Metadata components to retrieve (e.g. "ApexClass:MyClass")',
-        },
-        manifest: {
-          type: "string",
-          description: "Path to package.xml manifest",
-        },
-        source_dir: {
-          type: "string",
-          description: "Source files to retrieve",
-        },
-        output_dir: {
-          type: "string",
-          description: "Output directory for retrieved files",
-        },
-        org: { type: "string", description: "Org alias or username" },
-      },
+      required: ["sobject", "record_id"],
     },
   },
   {
     name: "sf_apex_run",
-    description:
-      "Execute anonymous Apex code in an org. Provide either inline code or a file path.",
+    description: "Execute anonymous Apex code.",
     inputSchema: {
       type: "object",
       properties: {
-        code: {
-          type: "string",
-          description: "Inline Apex code to execute",
-        },
-        file: {
-          type: "string",
-          description: "Path to .apex file to execute",
-        },
-        org: { type: "string", description: "Org alias or username" },
+        code: { type: "string", description: "Apex code to execute" },
+        org: { type: "string", description: "Org alias" },
       },
+      required: ["code"],
     },
   },
   {
     name: "sf_apex_test",
-    description: "Run Apex tests in an org.",
+    description: "Run Apex tests.",
     inputSchema: {
       type: "object",
       properties: {
@@ -379,406 +470,305 @@ const TOOLS = [
           type: "string",
           description: "Comma-separated test class names",
         },
-        suite_names: {
-          type: "string",
-          description: "Comma-separated test suite names",
-        },
         test_level: {
           type: "string",
-          enum: [
-            "RunSpecifiedTests",
-            "RunLocalTests",
-            "RunAllTestsInOrg",
-          ],
+          enum: ["RunSpecifiedTests", "RunLocalTests", "RunAllTestsInOrg"],
           description: "Test level",
         },
-        org: { type: "string", description: "Org alias or username" },
-        code_coverage: {
-          type: "boolean",
-          description: "Include code coverage results",
-        },
+        org: { type: "string", description: "Org alias" },
       },
     },
   },
   {
     name: "sf_apex_log",
-    description: "List or retrieve Apex debug logs from an org.",
+    description: "List or retrieve Apex debug logs.",
     inputSchema: {
       type: "object",
       properties: {
         action: {
           type: "string",
           enum: ["list", "get"],
-          description: "List logs or get a specific log",
+          description: "List recent logs or get a specific log body",
         },
         log_id: {
           type: "string",
-          description: "Log ID to retrieve (for get action)",
+          description: "Log ID (for 'get' action)",
         },
-        number: {
-          type: "number",
-          description: "Number of most recent logs to retrieve",
-        },
-        org: { type: "string", description: "Org alias or username" },
+        org: { type: "string", description: "Org alias" },
       },
     },
   },
   {
     name: "sf_list_metadata",
-    description: "List metadata components of a specified type in an org.",
+    description:
+      "List metadata components (ApexClass, ApexTrigger, CustomObject, Flow, etc.) via Tooling API.",
     inputSchema: {
       type: "object",
       properties: {
         metadata_type: {
           type: "string",
           description:
-            "Metadata type name (e.g. CustomObject, ApexClass, Flow)",
+            "Tooling API type (e.g. ApexClass, ApexTrigger, CustomObject, Flow)",
         },
-        org: { type: "string", description: "Org alias or username" },
+        org: { type: "string", description: "Org alias" },
       },
       required: ["metadata_type"],
     },
   },
   {
     name: "sf_org_limits",
-    description:
-      "Display API limits and usage for an org (DailyApiRequests, DataStorageMB, etc.).",
+    description: "Show API request limits and usage.",
     inputSchema: {
       type: "object",
       properties: {
-        org: { type: "string", description: "Org alias or username" },
+        org: { type: "string", description: "Org alias" },
       },
     },
   },
   {
     name: "sf_rest_api",
     description:
-      "Make a raw REST API request to a Salesforce org. Use for endpoints not covered by other tools.",
+      "Make a raw REST API request. Use for any endpoint not covered by other tools.",
     inputSchema: {
       type: "object",
       properties: {
         endpoint: {
           type: "string",
           description:
-            "REST API endpoint path (e.g. /services/data/v62.0/sobjects/Account/describe)",
+            "Full API path (e.g. /services/data/v62.0/sobjects/Account/describe)",
         },
         method: {
           type: "string",
           enum: ["GET", "POST", "PATCH", "PUT", "DELETE"],
-          description: "HTTP method",
-          default: "GET",
+          description: "HTTP method (default: GET)",
         },
         body: {
-          type: "string",
-          description: "Request body (JSON string) for POST/PATCH/PUT",
+          type: "object",
+          description: "Request body for POST/PATCH/PUT",
         },
-        org: { type: "string", description: "Org alias or username" },
+        org: { type: "string", description: "Org alias" },
       },
       required: ["endpoint"],
     },
   },
-  {
-    name: "sf_run_command",
-    description:
-      "Run any arbitrary sf CLI command. Use when no specific tool covers your need. Provide the full command after 'sf'.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        command: {
-          type: "string",
-          description:
-            'The sf CLI command to run (everything after "sf", e.g. "org list --all --json")',
-        },
-      },
-      required: ["command"],
-    },
-  },
 ];
 
+// ─── Tool Handlers ─────────────────────────────────────────
 const TOOL_HANDLERS = {
-  async sf_org_list({ all }) {
-    const args = ["org", "list", "--json"];
-    if (all) args.push("--all");
-    return runSf(args);
+  async sf_org_login({ alias, login_url }) {
+    const result = await oauthLogin(
+      alias,
+      login_url || "https://login.salesforce.com"
+    );
+    return JSON.stringify(
+      {
+        success: true,
+        alias,
+        username: result.username,
+        instanceUrl: result.instanceUrl,
+        orgId: result.orgId,
+      },
+      null,
+      2
+    );
+  },
+
+  async sf_org_logout({ alias }) {
+    const orgs = loadOrgs();
+    if (!orgs[alias])
+      return JSON.stringify({ error: `Org "${alias}" not found` });
+    delete orgs[alias];
+    saveOrgs(orgs);
+    return JSON.stringify({ success: true, removed: alias });
+  },
+
+  async sf_org_list() {
+    const orgs = loadOrgs();
+    const list = Object.entries(orgs).map(([alias, o]) => ({
+      alias,
+      username: o.username,
+      instanceUrl: o.instanceUrl,
+      orgId: o.orgId,
+      authenticatedAt: o.authenticatedAt,
+    }));
+    if (list.length === 0) {
+      return JSON.stringify({
+        message:
+          "No orgs connected. Use sf_org_login to authenticate a Salesforce org.",
+      });
+    }
+    return JSON.stringify(list, null, 2);
   },
 
   async sf_org_display({ org }) {
-    return runSf(["org", "display", ...orgArgs(org), "--json"]);
+    const o = getOrg(org);
+    try {
+      const versions = await sfApi(org, "");
+      return JSON.stringify(
+        {
+          alias: o._alias,
+          username: o.username,
+          instanceUrl: o.instanceUrl,
+          orgId: o.orgId,
+          authenticatedAt: o.authenticatedAt,
+          latestApiVersion: Array.isArray(versions)
+            ? versions[versions.length - 1]?.version
+            : undefined,
+        },
+        null,
+        2
+      );
+    } catch {
+      return JSON.stringify(
+        {
+          alias: o._alias,
+          username: o.username,
+          instanceUrl: o.instanceUrl,
+          orgId: o.orgId,
+          authenticatedAt: o.authenticatedAt,
+        },
+        null,
+        2
+      );
+    }
   },
 
   async sf_query({ query, org, tooling }) {
-    const args = ["data", "query", "-q", query, ...orgArgs(org), "--json"];
-    if (tooling) args.push("--use-tooling-api");
-    return runSf(args);
+    const prefix = tooling ? "/tooling" : "";
+    const result = await sfApi(
+      org,
+      `${prefix}/query?q=${encodeURIComponent(query)}`
+    );
+    return JSON.stringify(result, null, 2);
   },
 
   async sf_search({ query, org }) {
-    return runSf([
-      "data",
-      "search",
-      "-q",
-      query,
-      ...orgArgs(org),
-      "--json",
-    ]);
+    const result = await sfApi(
+      org,
+      `/search?q=${encodeURIComponent(query)}`
+    );
+    return JSON.stringify(result, null, 2);
   },
 
-  async sf_describe({ sobject, org, tooling }) {
-    const args = [
-      "sobject",
-      "describe",
-      "-s",
-      sobject,
-      ...orgArgs(org),
-      "--json",
-    ];
-    if (tooling) args.push("--use-tooling-api");
-    return runSf(args);
+  async sf_describe({ sobject, org }) {
+    const result = await sfApi(org, `/sobjects/${sobject}/describe`);
+    return JSON.stringify(result, null, 2);
   },
 
-  async sf_list_objects({ org, category }) {
-    const args = ["sobject", "list", ...orgArgs(org), "--json"];
-    if (category) args.push("-s", category);
-    return runSf(args);
+  async sf_list_objects({ org }) {
+    const result = await sfApi(org, "/sobjects");
+    return JSON.stringify(result, null, 2);
   },
 
   async sf_create_record({ sobject, values, org }) {
-    return runSf([
-      "data",
-      "create",
-      "record",
-      "-s",
-      sobject,
-      "-v",
-      values,
-      ...orgArgs(org),
-      "--json",
-    ]);
+    const result = await sfApi(org, `/sobjects/${sobject}`, {
+      method: "POST",
+      body: values,
+    });
+    return JSON.stringify(result, null, 2);
   },
 
-  async sf_update_record({ sobject, record_id, where, values, org }) {
-    const args = [
-      "data",
-      "update",
-      "record",
-      "-s",
-      sobject,
-      "-v",
-      values,
-      ...orgArgs(org),
-      "--json",
-    ];
-    if (record_id) args.push("-i", record_id);
-    if (where) args.push("-w", where);
-    return runSf(args);
+  async sf_update_record({ sobject, record_id, values, org }) {
+    await sfApi(org, `/sobjects/${sobject}/${record_id}`, {
+      method: "PATCH",
+      body: values,
+    });
+    return JSON.stringify({ success: true, id: record_id });
   },
 
-  async sf_delete_record({ sobject, record_id, where, org }) {
-    const args = [
-      "data",
-      "delete",
-      "record",
-      "-s",
-      sobject,
-      ...orgArgs(org),
-      "--json",
-    ];
-    if (record_id) args.push("-i", record_id);
-    if (where) args.push("-w", where);
-    return runSf(args);
+  async sf_delete_record({ sobject, record_id, org }) {
+    await sfApi(org, `/sobjects/${sobject}/${record_id}`, {
+      method: "DELETE",
+    });
+    return JSON.stringify({ success: true, deleted: record_id });
   },
 
-  async sf_get_record({ sobject, record_id, where, org }) {
-    const args = [
-      "data",
-      "get",
-      "record",
-      "-s",
-      sobject,
-      ...orgArgs(org),
-      "--json",
-    ];
-    if (record_id) args.push("-i", record_id);
-    if (where) args.push("-w", where);
-    return runSf(args);
+  async sf_get_record({ sobject, record_id, fields, org }) {
+    let path = `/sobjects/${sobject}/${record_id}`;
+    if (fields) path += `?fields=${encodeURIComponent(fields)}`;
+    const result = await sfApi(org, path);
+    return JSON.stringify(result, null, 2);
   },
 
-  async sf_bulk_import({ sobject, file, org, operation, external_id }) {
-    if (operation === "upsert" && external_id) {
-      return runSf([
-        "data",
-        "upsert",
-        "bulk",
-        "-s",
-        sobject,
-        "-f",
-        file,
-        "-i",
-        external_id,
-        ...orgArgs(org),
-        "--json",
-        "-w",
-        "10",
-      ]);
+  async sf_apex_run({ code, org }) {
+    const result = await sfApi(
+      org,
+      `/tooling/executeAnonymous?anonymousBody=${encodeURIComponent(code)}`
+    );
+    return JSON.stringify(result, null, 2);
+  },
+
+  async sf_apex_test({ class_names, test_level, org }) {
+    if (class_names) {
+      const tests = class_names
+        .split(",")
+        .map((c) => ({ className: c.trim() }));
+      const result = await sfApi(org, "/tooling/runTestsSynchronous", {
+        method: "POST",
+        body: { tests },
+      });
+      return JSON.stringify(result, null, 2);
     }
-    return runSf([
-      "data",
-      "import",
-      "bulk",
-      "-s",
-      sobject,
-      "-f",
-      file,
-      ...orgArgs(org),
-      "--json",
-      "-w",
-      "10",
-    ]);
-  },
-
-  async sf_bulk_export({ query, output_file, format, org }) {
-    return runSf([
-      "data",
-      "export",
-      "bulk",
-      "-q",
-      query,
-      "--output-file",
-      output_file,
-      "-r",
-      format || "csv",
-      ...orgArgs(org),
-      "--json",
-      "-w",
-      "10",
-    ]);
-  },
-
-  async sf_deploy({ source_dir, metadata, manifest, org, dry_run, test_level }) {
-    const args = ["project", "deploy", "start", ...orgArgs(org), "--json"];
-    if (source_dir) args.push("-d", source_dir);
-    if (metadata) args.push("-m", metadata);
-    if (manifest) args.push("-x", manifest);
-    if (dry_run) args.push("--dry-run");
-    if (test_level) args.push("-l", test_level);
-    return runSf(args);
-  },
-
-  async sf_retrieve({ metadata, manifest, source_dir, output_dir, org }) {
-    const args = [
-      "project",
-      "retrieve",
-      "start",
-      ...orgArgs(org),
-      "--json",
-    ];
-    if (metadata) args.push("-m", metadata);
-    if (manifest) args.push("-x", manifest);
-    if (source_dir) args.push("-d", source_dir);
-    if (output_dir) args.push("-r", output_dir);
-    return runSf(args);
-  },
-
-  async sf_apex_run({ code, file, org }) {
-    const args = ["apex", "run", ...orgArgs(org), "--json"];
-    if (file) {
-      args.push("-f", file);
+    if (test_level) {
+      const result = await sfApi(org, "/tooling/runTestsAsynchronous", {
+        method: "POST",
+        body: { testLevel: test_level },
+      });
+      return JSON.stringify(result, null, 2);
     }
-    // For inline code, we write to stdin — but sf CLI doesn't support that well via execFile.
-    // Instead, use a temp approach: write to a temp file.
-    if (code && !file) {
-      const { writeFileSync, unlinkSync } = await import("node:fs");
-      const { tmpdir } = await import("node:os");
-      const { join } = await import("node:path");
-      const tmpFile = join(tmpdir(), `sf-apex-${Date.now()}.apex`);
-      writeFileSync(tmpFile, code);
-      args.push("-f", tmpFile);
-      try {
-        const result = await runSf(args);
-        unlinkSync(tmpFile);
-        return result;
-      } catch (e) {
-        unlinkSync(tmpFile);
-        throw e;
-      }
-    }
-    return runSf(args);
+    return JSON.stringify({
+      error: "Provide class_names or test_level",
+    });
   },
 
-  async sf_apex_test({ class_names, suite_names, test_level, org, code_coverage }) {
-    const args = ["apex", "run", "test", ...orgArgs(org), "--json"];
-    if (class_names) args.push("-n", class_names);
-    if (suite_names) args.push("-s", suite_names);
-    if (test_level) args.push("-l", test_level);
-    if (code_coverage) args.push("-c");
-    return runSf(args);
-  },
-
-  async sf_apex_log({ action, log_id, number, org }) {
+  async sf_apex_log({ action, log_id, org }) {
     if (action === "get" && log_id) {
-      return runSf([
-        "apex",
-        "get",
-        "log",
-        "-i",
-        log_id,
-        ...orgArgs(org),
-        "--json",
-      ]);
+      const res = await sfRawApi(
+        org,
+        `/services/data/v${API_VERSION}/sobjects/ApexLog/${log_id}/Body`
+      );
+      return await res.text();
     }
-    if (action === "get" && number) {
-      return runSf([
-        "apex",
-        "get",
-        "log",
-        "-n",
-        String(number),
-        ...orgArgs(org),
-        "--json",
-      ]);
-    }
-    return runSf(["apex", "list", "log", ...orgArgs(org), "--json"]);
+    const result = await sfApi(
+      org,
+      `/tooling/query?q=${encodeURIComponent(
+        "SELECT Id, LogLength, Request, Operation, Application, Status, StartTime, DurationMilliseconds FROM ApexLog ORDER BY StartTime DESC LIMIT 20"
+      )}`
+    );
+    return JSON.stringify(result, null, 2);
   },
 
   async sf_list_metadata({ metadata_type, org }) {
-    return runSf([
-      "org",
-      "list",
-      "metadata",
-      "-m",
-      metadata_type,
-      ...orgArgs(org),
-      "--json",
-    ]);
+    const query = `SELECT Id, Name, NamespacePrefix FROM ${metadata_type} ORDER BY Name`;
+    const result = await sfApi(
+      org,
+      `/tooling/query?q=${encodeURIComponent(query)}`
+    );
+    return JSON.stringify(result, null, 2);
   },
 
   async sf_org_limits({ org }) {
-    return runSf(["org", "list", "limits", ...orgArgs(org), "--json"]);
+    const result = await sfApi(org, "/limits");
+    return JSON.stringify(result, null, 2);
   },
 
   async sf_rest_api({ endpoint, method, body, org }) {
-    const args = [
-      "api",
-      "request",
-      "rest",
-      endpoint,
-      ...orgArgs(org),
-      "--json",
-    ];
-    if (method) args.push("-X", method);
-    if (body) args.push("-b", body);
-    return runSf(args);
-  },
-
-  async sf_run_command({ command }) {
-    const args = command.split(/\s+/);
-    if (!args.includes("--json")) args.push("--json");
-    return runSf(args);
+    const res = await sfRawApi(org, endpoint, {
+      method: method || "GET",
+      body,
+    });
+    const text = await res.text();
+    try {
+      return JSON.stringify(JSON.parse(text), null, 2);
+    } catch {
+      return text;
+    }
   },
 };
 
+// ─── MCP Server ────────────────────────────────────────────
 const server = new Server(
-  { name: "salesforce-cli", version: "1.0.0" },
+  { name: "salesforce-cli", version: "2.0.0" },
   { capabilities: { tools: {} } }
 );
 
