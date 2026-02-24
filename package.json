@@ -1,0 +1,11 @@
+{
+  "name": "salesforce-cli-mcpb",
+  "version": "1.0.0",
+  "description": "Salesforce CLI desktop extension for Claude",
+  "type": "module",
+  "main": "server/index.js",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1"
+  }
+}

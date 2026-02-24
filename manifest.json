@@ -1,0 +1,74 @@
+{
+  "manifest_version": "0.3",
+  "name": "salesforce-cli",
+  "display_name": "Salesforce CLI",
+  "version": "1.0.0",
+  "description": "Connect Claude to your Salesforce orgs via the Salesforce CLI. Query data, deploy metadata, run Apex, manage users, and more across multiple orgs.",
+  "long_description": "A desktop extension that gives Claude direct access to the Salesforce CLI (`sf`). Built for consulting teams that manage multiple Salesforce orgs.\n\nFeatures:\n- Multi-org support with alias-based targeting\n- SOQL queries and SOSL searches\n- CRUD and bulk data operations\n- Metadata retrieval and deployment\n- Apex execution and testing\n- Schema exploration\n- User and permission management\n- REST API access\n\nRequires the Salesforce CLI (`sf`) to be installed and at least one org authenticated via `sf org login web`.",
+  "author": {
+    "name": "Fast Mode",
+    "url": "https://fastmode.ai"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/fastmode-ai/salesforce-cli-mcpb.git"
+  },
+  "license": "MIT",
+  "keywords": ["salesforce", "crm", "soql", "apex", "metadata", "consulting"],
+  "server": {
+    "type": "node",
+    "entry_point": "server/index.js",
+    "mcp_config": {
+      "command": "node",
+      "args": ["${__dirname}/server/index.js"],
+      "env": {
+        "SF_PATH": "${user_config.sf_path}",
+        "DEFAULT_ORG": "${user_config.default_org}"
+      }
+    }
+  },
+  "tools": [
+    { "name": "sf_org_list", "description": "List all authenticated Salesforce orgs" },
+    { "name": "sf_org_display", "description": "Display details about a specific org" },
+    { "name": "sf_query", "description": "Execute a SOQL query against an org" },
+    { "name": "sf_search", "description": "Execute a SOSL search against an org" },
+    { "name": "sf_describe", "description": "Describe an SObject's fields and metadata" },
+    { "name": "sf_list_objects", "description": "List all SObjects in an org" },
+    { "name": "sf_create_record", "description": "Create a record in an org" },
+    { "name": "sf_update_record", "description": "Update a record in an org" },
+    { "name": "sf_delete_record", "description": "Delete a record from an org" },
+    { "name": "sf_get_record", "description": "Retrieve a single record by ID or criteria" },
+    { "name": "sf_bulk_import", "description": "Bulk import records from a CSV file" },
+    { "name": "sf_bulk_export", "description": "Bulk export records to a CSV file" },
+    { "name": "sf_deploy", "description": "Deploy metadata to an org" },
+    { "name": "sf_retrieve", "description": "Retrieve metadata from an org" },
+    { "name": "sf_apex_run", "description": "Execute anonymous Apex code" },
+    { "name": "sf_apex_test", "description": "Run Apex tests in an org" },
+    { "name": "sf_apex_log", "description": "Get debug logs from an org" },
+    { "name": "sf_list_metadata", "description": "List metadata components of a given type" },
+    { "name": "sf_org_limits", "description": "Display org API limits" },
+    { "name": "sf_rest_api", "description": "Make a raw REST API request" },
+    { "name": "sf_run_command", "description": "Run any arbitrary sf CLI command" }
+  ],
+  "compatibility": {
+    "platforms": ["darwin", "win32"],
+    "runtimes": {
+      "node": ">=18.0.0"
+    }
+  },
+  "user_config": {
+    "sf_path": {
+      "type": "string",
+      "title": "Salesforce CLI Path",
+      "description": "Path to the sf CLI binary. Leave default if sf is in your PATH.",
+      "required": false,
+      "default": "sf"
+    },
+    "default_org": {
+      "type": "string",
+      "title": "Default Org Alias",
+      "description": "Default Salesforce org alias to use when none is specified.",
+      "required": false
+    }
+  }
+}
