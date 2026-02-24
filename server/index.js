@@ -8,7 +8,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { existsSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_ORG = process.env.DEFAULT_ORG || "";
@@ -46,13 +46,20 @@ function findSfPath() {
 }
 
 const SF_PATH = findSfPath();
+// Add sf's directory to PATH so #!/usr/bin/env node resolves
+const SF_DIR = dirname(SF_PATH);
+const ENV = {
+  ...process.env,
+  SF_JSON_OUTPUT: "true",
+  PATH: SF_DIR + ":" + (process.env.PATH || ""),
+};
 
 async function runSf(args) {
   try {
     const { stdout, stderr } = await execFileAsync(SF_PATH, args, {
       maxBuffer: 10 * 1024 * 1024,
       timeout: 120000,
-      env: { ...process.env, SF_JSON_OUTPUT: "true" },
+      env: ENV,
     });
     return stdout || stderr;
   } catch (err) {
